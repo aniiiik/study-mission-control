@@ -1552,7 +1552,7 @@ function Calculator({ onClose }: CalculatorProps) {
             <div className="flex items-center justify-between border-b border-white/10 px-4 py-4">
 
               <div className="flex items-center gap-2">
-
+        
                 <History
                   size={16}
                   className="text-violet-400"

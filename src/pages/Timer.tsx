@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   Calculator as CalculatorIcon,
   Check,
@@ -10,55 +10,44 @@ import {
   X,
 } from 'lucide-react'
 import Calculator from '../components/calculator/Calculator'
+import { supabase } from '../lib/supabase'
+
+interface Subject {
+  id: string
+  name: string
+  is_archived: boolean
+}
 
 interface StudySession {
-  id: number
+  id: string
   subject: string
   startedAt: string
   endedAt: string
   duration: number
 }
 
+const MAX_CONTINUOUS_SECONDS = 4 * 60 * 60
+const HEARTBEAT_INTERVAL_MS = 20_000
+
 const timerAnimations = `
   @keyframes fadeUp {
-    from {
-      opacity: 0;
-      transform: translateY(12px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
   }
 
   @keyframes floatGlow {
-    0%, 100% {
-      transform: translate(0, 0) scale(1);
-    }
-
-    50% {
-      transform: translate(12px, -10px) scale(1.05);
-    }
+    0%, 100% { transform: translate(0, 0) scale(1); }
+    50% { transform: translate(12px, -10px) scale(1.05); }
   }
 
   @keyframes timerPulse {
-    0%, 100% {
-      text-shadow: 0 0 0 rgba(139, 92, 246, 0);
-    }
-
-    50% {
-      text-shadow: 0 0 30px rgba(139, 92, 246, 0.35);
-    }
+    0%, 100% { text-shadow: 0 0 0 rgba(139, 92, 246, 0); }
+    50% { text-shadow: 0 0 30px rgba(139, 92, 246, 0.35); }
   }
 
   @keyframes statusPulse {
-    0%, 100% {
-      opacity: 0.7;
-    }
-
-    50% {
-      opacity: 1;
-    }
+    0%, 100% { opacity: 0.7; }
+    50% { opacity: 1; }
   }
 
   .timer-fade-up {
@@ -88,7 +77,6 @@ const timerAnimations = `
   .timer-card:hover {
     transform: translateY(-2px);
     border-color: rgba(255, 255, 255, 0.16);
-
     box-shadow:
       0 25px 60px rgba(0, 0, 0, 0.35),
       0 0 40px rgba(139, 92, 246, 0.04);
@@ -241,24 +229,254 @@ const timerAnimations = `
 function Timer() {
   const [seconds, setSeconds] = useState(0)
   const [isRunning, setIsRunning] = useState(false)
+
   const [subject, setSubject] = useState('')
-  const [sessionStart, setSessionStart] =
-    useState<number | null>(null)
+  const [subjectId, setSubjectId] = useState('')
+  const [subjects, setSubjects] = useState<Subject[]>([])
+  const [subjectsLoading, setSubjectsLoading] = useState(true)
+
   const [activeStartedAt, setActiveStartedAt] =
     useState<number | null>(null)
+
+  /*
+   * IMPORTANT:
+   * This tracks the beginning of the CURRENT
+   * continuous run only.
+   *
+   * It is reset whenever the user pauses
+   * and starts again.
+   */
+  const [continuousStartedAt, setContinuousStartedAt] =
+    useState<number | null>(null)
+
+  const [databaseSessionId, setDatabaseSessionId] =
+    useState<string | null>(null)
+
+  const [sessionStart, setSessionStart] =
+    useState<number | null>(null)
+
   const [sessions, setSessions] =
     useState<StudySession[]>([])
+
   const [isCalculatorOpen, setIsCalculatorOpen] =
     useState(false)
 
+  const [saving, setSaving] = useState(false)
+  const [errorMessage, setErrorMessage] = useState('')
+
   /*
-   * Calculate the current elapsed study time.
-   *
-   * Because this uses Date.now(), the timer continues
-   * counting even when the browser is minimized or
-   * another tab/app is being used.
+   * Load subjects
    */
-  const getCurrentSeconds = useCallback(() => {
+  useEffect(() => {
+    const loadSubjects = async () => {
+      setSubjectsLoading(true)
+
+      const { data, error } = await supabase
+        .from('subjects')
+        .select('id, name, is_archived')
+        .eq('is_archived', false)
+        .order('name')
+
+      if (error) {
+        console.error('Failed to load subjects:', error)
+
+        setErrorMessage(
+          `Failed to load subjects: ${error.message}`,
+        )
+      } else {
+        setSubjects(data ?? [])
+      }
+
+      setSubjectsLoading(false)
+    }
+
+    loadSubjects()
+  }, [])
+
+  /*
+   * Refresh recovery.
+   */
+  useEffect(() => {
+    if (subjectsLoading || subjects.length === 0) {
+      return
+    }
+
+    const recoverSession = async () => {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser()
+
+      if (!user) return
+
+      const { data: session, error } = await supabase
+        .from('study_sessions')
+        .select(`
+          id,
+          subject_id,
+          started_at,
+          active_started_at,
+          focused_seconds,
+          status,
+          pause_started_at
+        `)
+        .eq('user_id', user.id)
+        .in('status', ['active', 'paused'])
+        .order('created_at', {
+          ascending: false,
+        })
+        .limit(1)
+        .maybeSingle()
+
+      if (error) {
+        console.error(
+          'Failed to recover session:',
+          error,
+        )
+        return
+      }
+
+      if (!session) return
+
+      const selectedSubject = subjects.find(
+        (item) => item.id === session.subject_id,
+      )
+
+      if (!selectedSubject) {
+        setErrorMessage(
+          'The subject for this session could not be found.',
+        )
+        return
+      }
+
+      setDatabaseSessionId(session.id)
+
+      setSessionStart(
+        new Date(session.started_at).getTime(),
+      )
+
+      setSeconds(session.focused_seconds)
+
+      setSubjectId(session.subject_id)
+
+      setSubject(selectedSubject.name)
+
+      /*
+       * ACTIVE SESSION
+       */
+      if (
+        session.status === 'active' &&
+        session.active_started_at
+      ) {
+        const activeStartedMs =
+          new Date(
+            session.active_started_at,
+          ).getTime()
+
+        const elapsed = Math.floor(
+          (Date.now() - activeStartedMs) / 1000,
+        )
+
+        /*
+         * IMPORTANT:
+         *
+         * 4-hour limit applies ONLY to the
+         * current active run.
+         *
+         * Previously this incorrectly used:
+         *
+         * focused_seconds + elapsed
+         *
+         * which made the 4-hour limit apply
+         * to the entire session.
+         */
+        if (elapsed >= MAX_CONTINUOUS_SECONDS) {
+          const pauseAt = new Date(
+            activeStartedMs +
+              MAX_CONTINUOUS_SECONDS * 1000,
+          )
+
+          const newTotal =
+            session.focused_seconds +
+            MAX_CONTINUOUS_SECONDS
+
+          const { error: pauseError } =
+            await supabase
+              .from('study_sessions')
+              .update({
+                status: 'paused',
+                focused_seconds: newTotal,
+                active_started_at: null,
+                pause_started_at:
+                  pauseAt.toISOString(),
+                last_heartbeat_at:
+                  new Date().toISOString(),
+              })
+              .eq('id', session.id)
+
+          if (pauseError) {
+            console.error(
+              'Failed to recover auto-pause:',
+              pauseError,
+            )
+            return
+          }
+
+          setSeconds(newTotal)
+          setActiveStartedAt(null)
+          setContinuousStartedAt(null)
+          setIsRunning(false)
+
+          setErrorMessage(
+            '4-hour continuous study limit reached. The timer has been paused. You can resume whenever you are ready.',
+          )
+
+          return
+        }
+
+        setActiveStartedAt(activeStartedMs)
+
+        /*
+         * Recovery means this active run started
+         * at active_started_at.
+         */
+        setContinuousStartedAt(activeStartedMs)
+
+        setIsRunning(true)
+      } else {
+        /*
+         * PAUSED SESSION
+         */
+        setActiveStartedAt(null)
+        setContinuousStartedAt(null)
+        setIsRunning(false)
+      }
+    }
+
+    recoverSession()
+  }, [subjects, subjectsLoading])
+
+  /*
+   * Force React to re-render once per second.
+   */
+  const [, forceUpdate] = useState(0)
+
+  useEffect(() => {
+    if (!isRunning) {
+      return
+    }
+
+    const interval = window.setInterval(() => {
+      forceUpdate((value) => value + 1)
+    }, 1000)
+
+    return () =>
+      window.clearInterval(interval)
+  }, [isRunning])
+
+  /*
+   * Calculate current focused seconds.
+   */
+  const getCurrentSeconds = () => {
     if (
       !isRunning ||
       activeStartedAt === null
@@ -266,136 +484,480 @@ function Timer() {
       return seconds
     }
 
-    const currentActiveSeconds = Math.floor(
-      (Date.now() - activeStartedAt) / 1000,
-    )
+    const currentActiveSeconds =
+      Math.floor(
+        (Date.now() - activeStartedAt) / 1000,
+      )
 
     return seconds + currentActiveSeconds
-  }, [isRunning, activeStartedAt, seconds])
+  }
 
   /*
-   * Update the visible timer once every second.
+   * Heartbeat + 4-hour automatic pause.
    *
-   * Previously this was 250ms, which caused 4 React
-   * updates per second. One update per second is enough
-   * for a study timer and reduces unnecessary work.
+   * IMPORTANT:
+   * 4-hour calculation uses ONLY the current
+   * continuous run.
    */
   useEffect(() => {
     if (
       !isRunning ||
-      activeStartedAt === null
+      !databaseSessionId ||
+      activeStartedAt === null ||
+      continuousStartedAt === null
     ) {
       return
     }
 
-    const interval = setInterval(() => {
-      const currentSeconds =
-        getCurrentSeconds()
+    const checkSession = async () => {
+      const nowMs = Date.now()
 
-      setSeconds((previousSeconds) =>
-        Math.max(
-          previousSeconds,
-          currentSeconds,
-        ),
-      )
-    }, 1000)
+      /*
+       * Current continuous run duration.
+       */
+      const continuousSeconds =
+        Math.floor(
+          (nowMs - continuousStartedAt) / 1000,
+        )
 
-    return () => {
-      clearInterval(interval)
+      /*
+       * Total session duration:
+       * previous focused time + current run.
+       */
+      const activeSeconds =
+        Math.floor(
+          (nowMs - activeStartedAt) / 1000,
+        )
+
+      const totalSeconds =
+        seconds + activeSeconds
+
+      /*
+       * 4-hour continuous limit.
+       */
+      if (
+        continuousSeconds >=
+        MAX_CONTINUOUS_SECONDS
+      ) {
+        const pauseAt = new Date(
+          continuousStartedAt +
+            MAX_CONTINUOUS_SECONDS * 1000,
+        )
+
+        const newTotal =
+          seconds +
+          MAX_CONTINUOUS_SECONDS
+
+        const { error } =
+          await supabase
+            .from('study_sessions')
+            .update({
+              status: 'paused',
+              focused_seconds: newTotal,
+              active_started_at: null,
+              pause_started_at:
+                pauseAt.toISOString(),
+              last_heartbeat_at:
+                new Date().toISOString(),
+            })
+            .eq('id', databaseSessionId)
+
+        if (error) {
+          console.error(
+            'Failed to auto-pause session:',
+            error,
+          )
+          return
+        }
+
+        setSeconds(newTotal)
+        setActiveStartedAt(null)
+        setContinuousStartedAt(null)
+        setIsRunning(false)
+
+        setErrorMessage(
+          '4-hour continuous study limit reached. The timer has been paused. You can resume whenever you are ready.',
+        )
+
+        return
+      }
+
+      /*
+       * Heartbeat.
+       */
+      const heartbeatTime =
+        new Date().toISOString()
+
+      const { error } = await supabase
+        .from('study_sessions')
+        .update({
+          focused_seconds:
+            totalSeconds,
+          last_heartbeat_at:
+            heartbeatTime,
+        })
+        .eq('id', databaseSessionId)
+
+      if (error) {
+        console.error(
+          'Heartbeat failed:',
+          error,
+        )
+      }
     }
+
+    /*
+     * Run immediately.
+     */
+    checkSession()
+
+    /*
+     * Then every 20 seconds.
+     */
+    const interval = window.setInterval(
+      checkSession,
+      HEARTBEAT_INTERVAL_MS,
+    )
+
+    return () =>
+      window.clearInterval(interval)
   }, [
     isRunning,
+    databaseSessionId,
     activeStartedAt,
-    getCurrentSeconds,
+    continuousStartedAt,
+    seconds,
   ])
 
-  const handleStart = () => {
-    if (!subject.trim()) {
+  /*
+   * Subject selection.
+   */
+  const handleSubjectChange = (
+    event: React.ChangeEvent<HTMLSelectElement>,
+  ) => {
+    const selectedId =
+      event.target.value
+
+    setSubjectId(selectedId)
+
+    const selectedSubject =
+      subjects.find(
+        (item) =>
+          item.id === selectedId,
+      )
+
+    setSubject(
+      selectedSubject?.name ?? '',
+    )
+  }
+
+  /*
+   * Start new session.
+   */
+  const handleStart = async () => {
+    if (!subjectId) {
       alert(
-        'Please enter what you are studying first.',
+        'Please select what you are studying first.',
       )
       return
     }
 
-    const now = Date.now()
+    setSaving(true)
+    setErrorMessage('')
 
-    if (sessionStart === null) {
-      setSessionStart(now)
+    const {
+      data: { user },
+    } = await supabase.auth.getUser()
+
+    if (!user) {
+      setErrorMessage(
+        'You must be logged in to start a study session.',
+      )
+      setSaving(false)
+      return
     }
 
-    setActiveStartedAt(now)
+    /*
+     * Check if another open session exists.
+     */
+    const { data: existingSession } =
+      await supabase
+        .from('study_sessions')
+        .select('id, status')
+        .eq('user_id', user.id)
+        .in('status', [
+          'active',
+          'paused',
+        ])
+        .limit(1)
+        .maybeSingle()
+
+    if (existingSession) {
+      setErrorMessage(
+        'You already have an open study session. Recovering it instead of starting another one.',
+      )
+
+      setSaving(false)
+
+      window.location.reload()
+
+      return
+    }
+
+    const now = new Date()
+    const nowMs = now.getTime()
+
+    const { data, error } =
+      await supabase
+        .from('study_sessions')
+        .insert({
+          user_id: user.id,
+          subject_id: subjectId,
+          mode: 'stopwatch',
+          status: 'active',
+          started_at:
+            now.toISOString(),
+          active_started_at:
+            now.toISOString(),
+          focused_seconds: 0,
+          last_heartbeat_at:
+            now.toISOString(),
+        })
+        .select('id')
+        .single()
+
+    if (error) {
+      console.error(
+        'Failed to create study session:',
+        error,
+      )
+
+      setErrorMessage(
+        `Could not start session: ${error.message}`,
+      )
+
+      setSaving(false)
+      return
+    }
+
+    setDatabaseSessionId(data.id)
+    setSessionStart(nowMs)
+    setActiveStartedAt(nowMs)
+
+    /*
+     * NEW continuous run starts here.
+     */
+    setContinuousStartedAt(nowMs)
+
+    setSeconds(0)
     setIsRunning(true)
+
+    /*
+     * Polished start message.
+     */
+    setErrorMessage(
+      'Study session started. You can study for up to 4 hours continuously. The timer will pause automatically after 4 hours. You can resume whenever you are ready.',
+    )
+
+    setSaving(false)
   }
 
-  const handlePause = () => {
+  /*
+   * Pause.
+   */
+  const handlePause = async () => {
     if (
       !isRunning ||
-      activeStartedAt === null
+      activeStartedAt === null ||
+      !databaseSessionId
     ) {
       return
     }
 
-    const now = Date.now()
+    setSaving(true)
+    setErrorMessage('')
 
-    const activeSeconds = Math.floor(
-      (now - activeStartedAt) / 1000,
-    )
+    const now = new Date()
+    const nowMs = now.getTime()
 
-    setSeconds(
-      (previousSeconds) =>
-        previousSeconds + activeSeconds,
-    )
-
-    setActiveStartedAt(null)
-    setIsRunning(false)
-  }
-
-  const handleResume = () => {
-    if (sessionStart === null) {
-      return
-    }
-
-    setActiveStartedAt(Date.now())
-    setIsRunning(true)
-  }
-
-  const handleFinish = () => {
-    if (sessionStart === null) {
-      return
-    }
-
-    let finalDuration = seconds
-
-    if (
-      isRunning &&
-      activeStartedAt !== null
-    ) {
-      const activeSeconds = Math.floor(
-        (Date.now() - activeStartedAt) /
-          1000,
+    const activeSeconds =
+      Math.floor(
+        (nowMs - activeStartedAt) / 1000,
       )
 
-      finalDuration =
-        seconds + activeSeconds
-    }
+    /*
+     * Manual pause ends the current continuous
+     * run but keeps total focused time.
+     */
+    const newTotalSeconds =
+      seconds + activeSeconds
 
-    if (finalDuration <= 0) {
+    const { error } =
+      await supabase
+        .from('study_sessions')
+        .update({
+          status: 'paused',
+          focused_seconds:
+            newTotalSeconds,
+          pause_started_at:
+            now.toISOString(),
+          active_started_at: null,
+          last_heartbeat_at:
+            now.toISOString(),
+        })
+        .eq('id', databaseSessionId)
+
+    if (error) {
+      console.error(
+        'Failed to pause study session:',
+        error,
+      )
+
+      setErrorMessage(
+        `Could not pause session: ${error.message}`,
+      )
+
+      setSaving(false)
       return
     }
 
-    const endedAt = Date.now()
+    setSeconds(newTotalSeconds)
+    setActiveStartedAt(null)
+
+    /*
+     * Current continuous run is finished.
+     */
+    setContinuousStartedAt(null)
+
+    setIsRunning(false)
+
+    setSaving(false)
+  }
+
+  /*
+   * Resume.
+   */
+  const handleResume = async () => {
+    if (
+      !databaseSessionId ||
+      sessionStart === null
+    ) {
+      return
+    }
+
+    setSaving(true)
+    setErrorMessage('')
+
+    const now = new Date()
+    const nowMs = now.getTime()
+
+    const { error } =
+      await supabase
+        .from('study_sessions')
+        .update({
+          status: 'active',
+          active_started_at:
+            now.toISOString(),
+          pause_started_at: null,
+          last_heartbeat_at:
+            now.toISOString(),
+        })
+        .eq('id', databaseSessionId)
+
+    if (error) {
+      console.error(
+        'Failed to resume study session:',
+        error,
+      )
+
+      setErrorMessage(
+        `Could not resume session: ${error.message}`,
+      )
+
+      setSaving(false)
+      return
+    }
+
+    setActiveStartedAt(nowMs)
+
+    /*
+     * NEW continuous 4-hour window.
+     *
+     * Previous focused time is preserved in
+     * `seconds`.
+     */
+    setContinuousStartedAt(nowMs)
+
+    setIsRunning(true)
+
+    setSaving(false)
+  }
+
+  /*
+   * Finish session.
+   */
+  const handleFinish = async () => {
+    if (
+      !databaseSessionId ||
+      sessionStart === null
+    ) {
+      return
+    }
+
+    setSaving(true)
+    setErrorMessage('')
+
+    const finalDuration =
+      getCurrentSeconds()
+
+    if (finalDuration <= 0) {
+      setSaving(false)
+      return
+    }
+
+    const endedAt = new Date()
+
+    const { error } =
+      await supabase
+        .from('study_sessions')
+        .update({
+          status: 'completed',
+          ended_at:
+            endedAt.toISOString(),
+          focused_seconds:
+            finalDuration,
+          active_started_at: null,
+          pause_started_at: null,
+          last_heartbeat_at:
+            endedAt.toISOString(),
+          updated_at:
+            endedAt.toISOString(),
+        })
+        .eq('id', databaseSessionId)
+
+    if (error) {
+      console.error(
+        'Failed to finish study session:',
+        error,
+      )
+
+      setErrorMessage(
+        `Could not finish session: ${error.message}`,
+      )
+
+      setSaving(false)
+      return
+    }
 
     const newSession: StudySession = {
-      id: Date.now(),
+      id: databaseSessionId,
       subject: subject.trim(),
       startedAt:
         new Date(
           sessionStart,
         ).toISOString(),
       endedAt:
-        new Date(
-          endedAt,
-        ).toISOString(),
+        endedAt.toISOString(),
       duration: finalDuration,
     }
 
@@ -410,15 +972,60 @@ function Timer() {
     setSeconds(0)
     setSessionStart(null)
     setActiveStartedAt(null)
+    setContinuousStartedAt(null)
+    setDatabaseSessionId(null)
     setSubject('')
+    setSubjectId('')
+
+    setSaving(false)
   }
 
-  const handleReset = () => {
+  /*
+   * Discard session.
+   */
+  const handleReset = async () => {
+    if (databaseSessionId) {
+      setSaving(true)
+
+      const { error } =
+        await supabase
+          .from('study_sessions')
+          .update({
+            status: 'finalized',
+            ended_at:
+              new Date().toISOString(),
+            active_started_at: null,
+            pause_started_at: null,
+            focused_seconds: 0,
+          })
+          .eq('id', databaseSessionId)
+
+      if (error) {
+        console.error(
+          'Failed to discard study session:',
+          error,
+        )
+
+        setErrorMessage(
+          `Could not discard session: ${error.message}`,
+        )
+
+        setSaving(false)
+        return
+      }
+
+      setSaving(false)
+    }
+
     setIsRunning(false)
     setSeconds(0)
     setSessionStart(null)
     setActiveStartedAt(null)
+    setContinuousStartedAt(null)
+    setDatabaseSessionId(null)
     setSubject('')
+    setSubjectId('')
+    setErrorMessage('')
   }
 
   const currentSeconds =
@@ -493,17 +1100,13 @@ function Timer() {
 
           {/* Header */}
           <div className="timer-fade-up mb-8 flex flex-wrap items-end justify-between gap-4">
-
             <div>
               <div className="mb-2 flex items-center gap-2 text-sm text-violet-400">
                 <Sparkles
                   size={16}
                   className="icon-button"
                 />
-
-                <span>
-                  FOCUS MODE
-                </span>
+                <span>FOCUS MODE</span>
               </div>
 
               <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">
@@ -517,7 +1120,6 @@ function Timer() {
             </div>
 
             <div className="flex items-center gap-3">
-
               <button
                 type="button"
                 onClick={() =>
@@ -525,15 +1127,13 @@ function Timer() {
                 }
                 className="calculator-trigger flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.05] px-4 py-2 text-sm font-medium text-slate-300"
               >
-                <CalculatorIcon size={16} />
-
-                <span>
-                  Calculator
-                </span>
+                <CalculatorIcon
+                  size={16}
+                />
+                <span>Calculator</span>
               </button>
 
               <div className="streak-pill hidden items-center gap-2 rounded-full border border-orange-500/20 bg-orange-500/10 px-3 py-1.5 text-sm text-orange-300 sm:flex">
-
                 <Flame
                   size={15}
                   className={
@@ -542,10 +1142,8 @@ function Timer() {
                       : ''
                   }
                 />
-
                 0 day streak
               </div>
-
             </div>
           </div>
 
@@ -565,7 +1163,6 @@ function Timer() {
 
               {/* Subject */}
               <div className="mb-8">
-
                 <label
                   htmlFor="subject"
                   className="mb-3 block text-sm font-medium text-slate-300"
@@ -576,41 +1173,71 @@ function Timer() {
 
                 <div className="rounded-2xl border border-white/10 bg-black/20 p-1.5 transition focus-within:border-violet-500/50">
 
-                  <input
+                  <select
                     id="subject"
-                    type="text"
-                    value={subject}
+                    value={subjectId}
                     disabled={
-                      sessionStart !== null
+                      sessionStart !== null ||
+                      subjectsLoading ||
+                      saving
                     }
-                    onChange={(event) =>
-                      setSubject(
-                        event.target.value,
-                      )
+                    onChange={
+                      handleSubjectChange
                     }
-                    placeholder="e.g. Indian Polity, React, Thermodynamics..."
-                    className="timer-input w-full bg-transparent px-4 py-3 text-sm text-white outline-none placeholder:text-slate-600 disabled:cursor-not-allowed disabled:opacity-60"
-                  />
+                    className="timer-input w-full cursor-pointer bg-transparent px-4 py-3 text-sm text-white outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    <option
+                      value=""
+                      className="bg-slate-900 text-slate-400"
+                    >
+                      {subjectsLoading
+                        ? 'Loading subjects...'
+                        : subjects.length ===
+                            0
+                          ? 'No subjects yet — add one first'
+                          : 'Select a subject'}
+                    </option>
 
+                    {subjects.map(
+                      (item) => (
+                        <option
+                          key={item.id}
+                          value={item.id}
+                          className="bg-slate-900 text-white"
+                        >
+                          {item.name}
+                        </option>
+                      ),
+                    )}
+                  </select>
                 </div>
 
                 <p className="mt-2 px-1 text-xs text-slate-500">
                   {sessionStart !== null
                     ? 'Finish or discard this session to change the subject.'
-                    : "Type any subject. We'll remember it for your future sessions."}
+                    : subjects.length ===
+                        0
+                      ? 'Go to Subjects and add your first subject.'
+                      : 'Choose one of your saved subjects for this session.'}
                 </p>
-
               </div>
+
+              {/* Error */}
+              {errorMessage && (
+                <div className="mb-6 rounded-2xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+                  {errorMessage}
+                </div>
+              )}
 
               {/* Timer modes */}
               <div className="mx-auto flex w-fit rounded-full border border-white/10 bg-black/30 p-1">
-
                 <button
                   type="button"
                   className="mode-button flex items-center gap-2 rounded-full bg-white px-5 py-2 text-sm font-semibold text-slate-900 shadow-lg"
                 >
-                  <Clock3 size={16} />
-
+                  <Clock3
+                    size={16}
+                  />
                   Stopwatch
                 </button>
 
@@ -620,12 +1247,10 @@ function Timer() {
                 >
                   Pomodoro
                 </button>
-
               </div>
 
               {/* Timer */}
               <div className="py-14 text-center">
-
                 <div className="text-xs font-medium uppercase tracking-[0.3em] text-slate-500">
                   Focused time
                 </div>
@@ -656,6 +1281,12 @@ function Timer() {
                         : 'Ready when you are.'}
                 </div>
 
+                {isRunning && (
+                  <p className="mt-3 text-xs text-slate-500">
+                    Maximum continuous run:
+                    4 hours
+                  </p>
+                )}
               </div>
 
               {/* Actions */}
@@ -665,14 +1296,20 @@ function Timer() {
                   <button
                     type="button"
                     onClick={handleStart}
-                    className="action-button group flex items-center gap-2 rounded-full bg-white px-7 py-3.5 font-semibold text-slate-950 shadow-lg shadow-white/10 hover:bg-slate-100 hover:shadow-xl hover:shadow-white/10"
+                    disabled={
+                      saving ||
+                      subjectsLoading
+                    }
+                    className="action-button group flex items-center gap-2 rounded-full bg-white px-7 py-3.5 font-semibold text-slate-950 shadow-lg shadow-white/10 hover:bg-slate-100 hover:shadow-xl hover:shadow-white/10 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     <Play
                       size={18}
                       className="transition-transform duration-200 group-hover:translate-x-0.5"
                     />
 
-                    Start Session
+                    {saving
+                      ? 'Starting...'
+                      : 'Start Session'}
                   </button>
                 )}
 
@@ -680,12 +1317,19 @@ function Timer() {
                   isRunning && (
                     <button
                       type="button"
-                      onClick={handlePause}
-                      className="action-button flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.05] px-6 py-3.5 font-medium text-slate-300 hover:bg-white/10 hover:text-white"
+                      onClick={
+                        handlePause
+                      }
+                      disabled={saving}
+                      className="action-button flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.05] px-6 py-3.5 font-medium text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-50"
                     >
-                      <Pause size={18} />
+                      <Pause
+                        size={18}
+                      />
 
-                      Pause
+                      {saving
+                        ? 'Saving...'
+                        : 'Pause'}
                     </button>
                   )}
 
@@ -693,12 +1337,19 @@ function Timer() {
                   !isRunning && (
                     <button
                       type="button"
-                      onClick={handleResume}
-                      className="action-button flex items-center gap-2 rounded-full bg-white px-6 py-3.5 font-semibold text-slate-950 shadow-lg hover:bg-slate-100"
+                      onClick={
+                        handleResume
+                      }
+                      disabled={saving}
+                      className="action-button flex items-center gap-2 rounded-full bg-white px-6 py-3.5 font-semibold text-slate-950 shadow-lg hover:bg-slate-100 disabled:opacity-50"
                     >
-                      <Play size={18} />
+                      <Play
+                        size={18}
+                      />
 
-                      Resume
+                      {saving
+                        ? 'Saving...'
+                        : 'Resume'}
                     </button>
                   )}
 
@@ -706,37 +1357,43 @@ function Timer() {
                   currentSeconds > 0 && (
                     <button
                       type="button"
-                      onClick={handleFinish}
-                      className="action-button flex items-center gap-2 rounded-full bg-violet-500 px-6 py-3.5 font-semibold text-white shadow-lg shadow-violet-500/20 hover:bg-violet-400"
+                      onClick={
+                        handleFinish
+                      }
+                      disabled={saving}
+                      className="action-button flex items-center gap-2 rounded-full bg-violet-500 px-6 py-3.5 font-semibold text-white shadow-lg shadow-violet-500/20 hover:bg-violet-400 disabled:opacity-50"
                     >
-                      <Check size={18} />
+                      <Check
+                        size={18}
+                      />
 
-                      Finish Session
+                      {saving
+                        ? 'Saving...'
+                        : 'Finish Session'}
                     </button>
                   )}
 
                 {sessionStart !== null && (
                   <button
                     type="button"
-                    onClick={handleReset}
-                    className="action-button flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.05] px-5 py-3.5 font-medium text-slate-300 hover:bg-white/10 hover:text-white"
+                    onClick={
+                      handleReset
+                    }
+                    disabled={saving}
+                    className="action-button flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.05] px-5 py-3.5 font-medium text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-50"
                   >
                     <X size={18} />
-
                     Discard
                   </button>
                 )}
-
               </div>
 
               {/* Status */}
               <div className="mt-8 flex justify-center">
-
                 <div className="status-pill rounded-full border border-white/5 bg-white/[0.03] px-4 py-2 text-xs text-slate-500">
                   💡 Background/minimized time
                   continues to count
                 </div>
-
               </div>
 
             </div>
@@ -771,8 +1428,7 @@ function Timer() {
                 )}
                 h{' '}
                 {Math.floor(
-                  (currentSeconds %
-                    3600) /
+                  (currentSeconds % 3600) /
                     60,
                 )
                   .toString()
@@ -802,7 +1458,6 @@ function Timer() {
           <div className="timer-fade-up mt-6 rounded-3xl border border-white/10 bg-white/[0.04] p-5 backdrop-blur-xl sm:p-6">
 
             <div className="mb-5 flex items-center justify-between">
-
               <div>
                 <p className="text-xs font-medium uppercase tracking-[0.2em] text-violet-400">
                   Activity
@@ -815,11 +1470,11 @@ function Timer() {
 
               <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-slate-400">
                 {sessions.length}{' '}
-                {sessions.length === 1
+                {sessions.length ===
+                1
                   ? 'session'
                   : 'sessions'}
               </span>
-
             </div>
 
             {sessions.length === 0 ? (
@@ -853,7 +1508,6 @@ function Timer() {
                     >
 
                       <div className="min-w-0">
-
                         <p className="truncate font-medium text-white">
                           {session.subject}
                         </p>
@@ -867,17 +1521,14 @@ function Timer() {
                             session.endedAt,
                           )}
                         </p>
-
                       </div>
 
                       <div className="flex items-center gap-2">
-
                         <span className="rounded-full border border-violet-500/20 bg-violet-500/10 px-3 py-1 text-xs font-medium text-violet-300">
                           {formatDuration(
                             session.duration,
                           )}
                         </span>
-
                       </div>
 
                     </div>
